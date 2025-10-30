@@ -1,16 +1,25 @@
+# benchmark_feature_importance.py
+# ShapG+MST, CIS, SamplingSHAP, and LIME benchmarking
+# - Feature-drop curves (like Fig. 8/9)
+# - Weighted slope S (alpha=0.8)
+# - Empty-feature baseline guard to avoid LightGBM crash
+
+from __future__ import annotations
 import os
-import sys
 import pickle
+from typing import Callable, Dict, List, Tuple, Any
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
-import networkx as nx
-from scipy.stats import kendalltau, pearsonr
+
+from sklearn.base import clone, is_classifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, accuracy_score
+from sklearn.metrics import accuracy_score, r2_score
+
 import lightgbm as lgb
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname('.'), '..')))
+import networkx as nx
+from scipy.stats import spearmanr
 
 from shapG.shapley import shapG, cis
 import shapG.plot as shapGplot
@@ -283,214 +292,573 @@ def create_minimal_edge_graph_mst(
             connected_nodes.update([u, v])
 
     return adjacency_matrix, reduced_df
+
+
 ###################################################################################
+# === Drop-in replacement ===
+# Keeps the same API & return values as the author's code, with optimized graph creation options.
+import pandas as pd
+import numpy as np
+import networkx as nx
+from scipy.stats import pearsonr, kendalltau, spearmanr
+from sklearn.metrics import mutual_info_score
+from sklearn.feature_selection import mutual_info_regression
+from typing import Callable, Optional
+from typing import Any, Tuple, Dict, List
+# -------------------------
+# 1) Correlation generator
+# -------------------------
 
-# Data readers
-def housing_data_reader(filename='./examples/data/housing_price.csv'):
-    data = pd.read_csv(filename)
-    X = data.drop(['MEDV'], axis=1)
-    y = data['MEDV']
-    return X, y
+# ===== optional deps =====
+try:
+    import shap
+except Exception:
+    shap = None
 
-def h1n1_data_reader(filename='./examples/data/process_data.csv'):
-    data = pd.read_csv(filename)
-    X = data.drop(['h1n1_vaccine', 'respondent_id', 'seasonal_vaccine'], axis=1)
-    y = data['h1n1_vaccine']
-    return X, y
+try:
+    from lime.lime_tabular import LimeTabularExplainer
+except Exception:
+    LimeTabularExplainer = None
 
-def plot_KPI_comparison_by_dict(reader, feature_rankings, model, filename=None, limit=7):
+# ==== Your project modules (adjust paths if needed) ====
+try:
+    from cis import cis
+except Exception:
+    cis = None  # If CIS is not available, we will skip it safely.
+
+
+# =============================================================================
+# KPI HELPERS (classification accuracy / regression R^2), with empty-feature guard
+# =============================================================================
+
+def classification_kpi(X: pd.DataFrame, y: np.ndarray, S, *,
+                       test_size: float = 0.2,
+                       random_state: int = 42,
+                       model: lgb.LGBMClassifier | None = None) -> float:
     """
-    Plot the comparison of KPIs for different feature selection methods.
-
-    Parameters:
-    - reader: Function to read the dataset.
-    - feature_rankings: Dictionary where keys are method names and values are lists of features in order of importance.
-    - model: The machine learning model to use (LGBM or MLP).
-    - filename: File name to save the plot.
-    - limit: Maximum number of features to consider.
-
-    Returns:
-    - Dictionary containing results for each method.
+    Accuracy-based KPI for a subset of features S (classification).
+    If S is empty, return majority-class accuracy (baseline).
     """
-    # Define model specific parameters
-    random_states = {
-        lgb.LGBMClassifier: [10, 10],
-        lgb.LGBMRegressor: [42, 42]
-    }
-    test_sizes = {
-        lgb.LGBMClassifier: [0.2, 0.2],
-        lgb.LGBMRegressor: [0.2, 0.3]
-    }
-    random_state = random_states.get(type(model), [42, 42])
-    test_size = test_sizes.get(type(model), [0.2, 0.2])
-    
-    # Generate results file name
-    model_name = type(model).__name__
-    results_file = f"{model_name}_dict_results.pkl"
-
-    # Load or calculate results
-    if os.path.exists(results_file):
-        with open(results_file, 'rb') as f:
-            results = pickle.load(f)
-        print(f"Loaded results for {model_name} from disk.")
-    else:
-        X, y = reader()
-        results = {}
-        
-        # Calculate initial metric (without dropping features)
-        x_train, x_test, y_train, y_test = train_test_split(
-            X, y, test_size=test_size[0], random_state=random_state[0]
-        )
-        model.fit(x_train, y_train)
-        y_pred = model.predict(x_test)
-        initial_metric = r2_score(y_test, y_pred) if isinstance(model, lgb.LGBMRegressor) else accuracy_score(y_test, y_pred)
-        
-        # Process each ranking method
-        for method, feature_order in feature_rankings.items():
-            # Make sure feature_order contains only column names as strings
-            feature_order = [feat if isinstance(feat, str) else feat[0] for feat in feature_order]
-            
-            if limit:
-                feature_order = feature_order[:limit]
-                
-            metrics = [initial_metric]
-            features = [[]]
-            deltas = []
-            
-            for i in range(1, len(feature_order) + 1):
-                features_to_drop = feature_order[:i]
-                # Check if all features exist in dataframe
-                missing_cols = [col for col in features_to_drop if col not in X.columns]
-                if missing_cols:
-                    print(f"Warning: Columns {missing_cols} not found in dataset. Skipping.")
-                    continue
-                    
-                reduced_X = X.drop(columns=features_to_drop)
-                x_train, x_test, y_train, y_test = train_test_split(
-                    reduced_X, y, test_size=test_size[1], random_state=random_state[1]
-                )
-                model.fit(x_train, y_train)
-                y_pred = model.predict(x_test)
-                new_metric = r2_score(y_test, y_pred) if isinstance(model, lgb.LGBMRegressor) else accuracy_score(y_test, y_pred)
-                deltas.append(metrics[-1] - new_metric)
-                metrics.append(new_metric)
-                features.append(features_to_drop)
-            
-            # Calculate weighted slope for comparison
-            beta = 0.8
-            weight = [beta**i for i in range(len(deltas))]
-            results[method] = {
-                'Features': features,
-                'Metrics': metrics,
-                'Slope': np.dot(deltas, weight) if deltas else 0
-            }
-
-        # Save results to disk
-        with open(results_file, 'wb') as f:
-            pickle.dump(results, f)
-        print(f"Saved results for {model_name} to disk.")
-
-    # Create the plot
-    plt.figure(figsize=(12, 8))
-    metric_name = "$R^2$" if isinstance(model, lgb.LGBMRegressor) else "Accuracy"
-    
-    for method, data in results.items():
-        label = f'{method} $S$={data["Slope"]:.4f}'
-        plt.plot(
-            range(len(data['Metrics'])), 
-            data['Metrics'], 
-            label=label, 
-            alpha=0.6
-        )
-    
-    plt.xlabel('Number of Features Dropped')
-    plt.ylabel(metric_name)
-    plt.title(f'Comparison of {metric_name} after dropping features based on different XAI methods ({model_name})')
-    plt.legend()
-    plt.grid()
-    
-    if filename:
-        plt.savefig(filename, dpi=300)
-    # plt.show()
-    
-    return results
-
-def benchmark_feature_importance(reader, model, filename=None, limit=7):
-    """
-    Benchmark feature importance using different methods.
-
-    Parameters:
-    - reader: Function to read the dataset.
-    - model: The machine learning model to use (LGBM or MLP).
-    - filename: File name to save the plot.
-    - limit: Maximum number of features to consider.
-    """
-    X, y = reader()
-    W =  matrix_generator_mst(X)
-    A, W_new = create_minimal_edge_graph_mst(W, reverse=True, version='mst')
-    G = nx.Graph(A)
-
-    # Compute Shapley values
-    shapley_values = shapG(G, m=3, f=lambda G, S: classification_kpi(X, y, S), approximate_by_ratio=True, scale=True)
-    cis_values = cis(G, f=lambda G, S: classification_kpi(X, y, S))
-    
-    # Convert to sorted feature lists for plot_KPI_comparison_by_dict
-    feature_rankings = {}
-    
-    # Add shapG values - ensure we map node IDs to actual column names
-    sorted_shapley = sorted(shapley_values.items(), key=lambda x: x[1], reverse=True)
-    feature_rankings['shapG'] = []
-    for node, value in sorted_shapley:
-        # Convert node ID to integer index
-        try:
-            idx = int(node)
-            if 0 <= idx < len(X.columns):
-                feature_rankings['shapG'].append(X.columns[idx])
-        except (ValueError, TypeError):
-            # If node isn't a valid integer, use it directly if it's a column name
-            if node in X.columns:
-                feature_rankings['shapG'].append(node)
-    
-    # Add CIS values
-    sorted_cis = sorted(cis_values.items(), key=lambda x: x[1], reverse=True)
-    feature_rankings['CIS'] = []
-    for node, value in sorted_cis:
-        try:
-            idx = int(node)
-            if 0 <= idx < len(X.columns):
-                feature_rankings['CIS'].append(X.columns[idx])
-        except (ValueError, TypeError):
-            if node in X.columns:
-                feature_rankings['CIS'].append(node)
-    
-    # Add model feature importances if available
-    if hasattr(model, 'feature_importances_'):
-        # Train the model to get feature importances
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        model.fit(X_train, y_train)
-        importances = model.feature_importances_
-        feature_indices = np.argsort(importances)[::-1]
-        feature_rankings['Model'] = [X.columns[i] for i in feature_indices]
-    
-    # Plot the comparison
-    results = plot_KPI_comparison_by_dict(reader, feature_rankings, model, filename, limit)
-    
-    return shapley_values, cis_values, results
-# Classification KPI
-def classification_kpi(X, y, S):
     cols = list(S)
     if len(cols) == 0:
-        return 0
-    else:
-        X_train, X_test, y_train, y_test = train_test_split(X[cols], y, test_size=0.2, random_state=42)
-        model = lgb.LGBMRegressor(learning_rate=0.3, verbosity=-1)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-        return r2_score(y_test, y_pred)
+        vals, counts = np.unique(y, return_counts=True)
+        return float(np.max(counts) / len(y))
 
+    if model is None:
+        model = lgb.LGBMClassifier(learning_rate=0.05, verbosity=-1)
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        X[cols], y, test_size=test_size, random_state=random_state, stratify=y
+    )
+    model.fit(x_train, y_train)
+    y_pred = model.predict(x_test)
+    return float(accuracy_score(y_test, y_pred))
+
+
+def r2_kpi(X: pd.DataFrame, y: np.ndarray, S, *,
+           test_size: float = 0.2,
+           random_state: int = 42,
+           model: lgb.LGBMRegressor | None = None) -> float:
+    """
+    R² KPI for a subset of features S (regression).
+    If S is empty, return 0.0 (mean predictor baseline).
+    """
+    cols = list(S)
+    if len(cols) == 0:
+        return 0.0
+
+    if model is None:
+        model = lgb.LGBMRegressor(learning_rate=0.05, verbosity=-1)
+
+    x_train, x_test, y_train, y_test = train_test_split(
+        X[cols], y, test_size=test_size, random_state=random_state
+    )
+    model.fit(x_train, y_train)
+    y_pred = model.predict(x_test)
+    return float(r2_score(y_test, y_pred))
+
+
+def _baseline_score_from_train(y_train: np.ndarray, y_val: np.ndarray, task: str) -> float:
+    """
+    When there are ZERO features, don't fit a model.
+    - Classification: majority-class accuracy on the validation fold.
+    - Regression: R^2 baseline ≈ 0.0
+    """
+    if task == "cls":
+        vals, counts = np.unique(y_train, return_counts=True)
+        maj = vals[np.argmax(counts)]
+        return float(np.mean(y_val == maj))
+    else:
+        return 0.0
+
+
+# =============================================================================
+# Utility: robustly convert ShapG/CIS output to {feature_name: float_value}
+# =============================================================================
+
+def _to_phi_dict(shap_out: Any, feature_names: List[str]) -> Dict[str, float]:
+    feats = list(feature_names)
+    if isinstance(shap_out, dict):
+        keys = list(shap_out.keys())
+        # keyed by names
+        if all(k in feats for k in keys):
+            return {k: float(shap_out[k]) for k in keys}
+        # keyed by indices
+        try:
+            idx = [int(k) for k in keys]
+            if all(0 <= i < len(feats) for i in idx):
+                return {feats[int(k)]: float(shap_out[k]) for k in keys}
+        except Exception:
+            pass
+    arr = np.asarray(shap_out).reshape(-1)
+    assert len(arr) == len(feats), "Output length != #features"
+    return {f: float(v) for f, v in zip(feats, arr)}
+
+
+# =============================================================================
+# Global ranking helpers: SamplingSHAP and LIME
+# =============================================================================
+
+def global_ranking_sampling_shap(X: pd.DataFrame,
+                                 y: np.ndarray,
+                                 model,
+                                 is_cls: bool,
+                                 n_bg: int = 200,
+                                 nsamples: int = 2048,
+                                 random_state: int = 42) -> List[str]:
+    """
+    Compute global feature ranking using SHAP SamplingExplainer.
+    Returns list of features sorted most->least important (mean |shap|).
+    """
+    if shap is None:
+        print("[warn] shap not installed; skipping SamplingSHAP.")
+        return []
+
+    rng = np.random.RandomState(random_state)
+
+    # Fit the model once on all features
+    mdl = clone(model)
+    mdl.fit(X, y)
+
+    # Background subset for SHAP (NumPy arrays are safer with Sampling/Kernel explainers)
+    bg_idx = rng.choice(len(X), size=min(n_bg, len(X)), replace=False)
+    X_bg_np = X.iloc[bg_idx].to_numpy()
+    X_np = X.to_numpy()
+
+    # ---- Wrap the predictor so SHAP can set attributes on it ----
+    class _PredictorWrapper:
+        def __init__(self, mdl, is_cls):
+            self.mdl = mdl
+            self.is_cls = is_cls
+            # SHAP may try to set this; make it writable
+            self.feature_names_in_ = None
+
+        def __call__(self, A):
+            # A is a numpy array
+            if self.is_cls:
+                # return probabilities for Kernel/Sampling explainers
+                return self.mdl.predict_proba(A)
+            else:
+                return self.mdl.predict(A)
+
+    fwrap = _PredictorWrapper(mdl, is_cls)
+
+    # Build explainer
+    explainer = shap.SamplingExplainer(fwrap, X_bg_np, seed=random_state)
+
+    # Explain a manageable subset (use background size for symmetry)
+    explain_idx = rng.choice(len(X_np), size=min(len(X_np), n_bg), replace=False)
+    shap_exp = explainer(X_np[explain_idx], nsamples=nsamples)
+
+    # ---- Aggregate to global feature importance (mean |shap| per feature) ----
+    # Handle multiple possible shapes from different SHAP versions.
+    # Target: vals shape = (n_features,)
+    n_features = X.shape[1]
+    arr = shap_exp.values
+
+    if isinstance(arr, list):
+        # Old classification API: list of arrays [ (n_samples, n_features) per class ]
+        vals = np.mean([np.abs(a).mean(axis=0) for a in arr], axis=0)
+    else:
+        arr = np.asarray(arr)
+        if arr.ndim == 2 and arr.shape[1] == n_features:
+            # (n_samples, n_features)
+            vals = np.mean(np.abs(arr), axis=0)
+        elif arr.ndim == 3:
+            # Could be (n_samples, n_features, n_outputs) or (n_samples, n_outputs, n_features)
+            axes = list(range(3))
+            # find which axis is features
+            feat_axis = [ax for ax in axes if arr.shape[ax] == n_features]
+            if not feat_axis:
+                raise ValueError(f"Unexpected SHAP values shape {arr.shape}; cannot locate feature axis={n_features}")
+            feat_axis = feat_axis[0]
+            reduce_axes = tuple(ax for ax in axes if ax != feat_axis)
+            vals = np.mean(np.abs(arr), axis=reduce_axes)
+        else:
+            raise ValueError(f"Unexpected SHAP values shape: {arr.shape}")
+
+    phi = {f: float(v) for f, v in zip(X.columns, vals)}
+    return sorted(phi, key=phi.get, reverse=True)
+
+def global_ranking_lime(X: pd.DataFrame,
+                        y: np.ndarray,
+                        model,
+                        is_cls: bool,
+                        n_rows_lime: int = 300,
+                        random_state: int = 42) -> List[str]:
+    """
+    Compute global feature ranking using LIME (mean |weight| per feature across explained rows).
+    Returns list of features sorted most->least important.
+    """
+    if LimeTabularExplainer is None:
+        print("[warn] lime not installed; skipping LIME.")
+        return []
+    rng = np.random.RandomState(random_state)
+
+    # Fit model on all features to get a stable predictor
+    mdl = clone(model)
+    mdl.fit(X, y)
+
+    # Build explainer
+    X_np = X.values
+    feature_names = list(X.columns)
+    explainer = LimeTabularExplainer(
+        training_data=X_np,
+        feature_names=feature_names,
+        class_names=np.unique(y) if is_cls else None,
+        mode='classification' if is_cls else 'regression',
+        discretize_continuous=False, # keep numeric as-is for tabular medical data
+        random_state=random_state
+    )
+
+    # sample rows to explain
+    idx = rng.choice(len(X), size=min(n_rows_lime, len(X)), replace=False)
+
+    # aggregate absolute weights
+    agg = np.zeros(X.shape[1], dtype=float)
+    for i in idx:
+        x0 = X_np[i]
+        if is_cls:
+            # choose class = model's predicted class for that instance
+            c = int(mdl.predict(X_np[[i]])[0])
+            exp = explainer.explain_instance(
+                x0,
+                mdl.predict_proba,
+                labels=[c],
+                num_features=X.shape[1]
+            )
+            weights = dict(exp.as_list(label=c))
+        else:
+            exp = explainer.explain_instance(
+                x0,
+                mdl.predict,
+                num_features=X.shape[1]
+            )
+            weights = dict(exp.as_list())
+
+        # Map weights back to feature indices by name
+        for j, name in enumerate(feature_names):
+            if name in weights:
+                agg[j] += abs(weights[name])
+
+    # mean |weight| per feature
+    agg /= max(1, len(idx))
+    phi = {f: float(v) for f, v in zip(feature_names, agg)}
+    return sorted(phi, key=phi.get, reverse=True)
+
+
+# =============================================================================
+# Feature-drop benchmarking (authors' style) with baseline guard
+# =============================================================================
+
+def slope_score_S(curve: List[Tuple[int, float]], alpha: float = 0.8) -> float:
+    """
+    Weighted slope score (higher = better).
+    Distribute each step's drop equally across the removed features at that step.
+    """
+    drops = []
+    for k in range(1, len(curve)):
+        r_prev, s_prev = curve[k - 1]
+        r_cur, s_cur = curve[k]
+        step = max(1, r_cur - r_prev)
+        delta = max(0.0, s_prev - s_cur)
+        drops.extend([delta / step] * step)
+    if not drops:
+        return 0.0
+    weights = np.array([alpha ** i for i in range(len(drops))], dtype=float)
+    return float(np.sum(weights * np.array(drops)))
+
+
+def plot_KPI_comparison_by_dict(reader: Callable[[], Tuple[pd.DataFrame, np.ndarray]],
+                                feature_rankings: Dict[str, List[str]],
+                                model,
+                                filename: str | None = None,
+                                limit: int | None = None,
+                                test_size: float = 0.2,
+                                random_state: int = 42) -> Dict[str, Dict[str, Any]]:
+    """
+    Authors-style benchmarking plot with:
+      - Accuracy for classifiers, R^2 for regressors (auto).
+      - Baseline guard when 0 features remain (no fitting, no crash).
+      - Metric-aware cache filename.
+
+    Returns: dict method -> {"Curve": [(num_removed, score), ...], "Slope": float}
+    """
+    X, y = reader()
+    all_cols = list(X.columns)
+    is_cls = is_classifier(model)
+    metric_name = "$R^2$" if not is_cls else "Accuracy"
+
+    # cache per metric + limit
+    model_name = type(model).__name__
+    results_file = f"{model_name}_{'R2' if not is_cls else 'ACC'}_limit{limit}_dict_results.pkl"
+
+    if os.path.exists(results_file):
+        try:
+            with open(results_file, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, dict):
+                print(f"[cache] Using cached results: {results_file}")
+                _replot_curves(cached, metric_name, filename)
+                return cached
+        except Exception:
+            pass  # ignore corrupt cache
+
+    # One stratified/regular split for all methods (comparable curves)
+    stratify = y if is_cls else None
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, test_size=test_size, random_state=random_state, stratify=stratify
+    )
+
+    results: Dict[str, Dict[str, Any]] = {}
+
+    for name, ranking in feature_rankings.items():
+        # ensure ranking only includes real columns, and keep order
+        ranking = [f for f in ranking if f in all_cols]
+        if limit is None:
+            limit_iter = len(ranking)
+        else:
+            limit_iter = min(limit, len(ranking))
+
+        # Start with ALL features kept
+        kept = list(all_cols)
+        curve: List[Tuple[int, float]] = []
+
+        # First point: 0 removed
+        X_sub_tr = X_train[kept]
+        X_sub_va = X_val[kept]
+        if X_sub_tr.shape[1] == 0:
+            score0 = _baseline_score_from_train(y_train, y_val, "cls" if is_cls else "reg")
+        else:
+            m0 = clone(model)
+            m0.fit(X_sub_tr, y_train)
+            pred0 = m0.predict(X_sub_va)
+            score0 = float(accuracy_score(y_val, pred0)) if is_cls else float(r2_score(y_val, pred0))
+        curve.append((0, score0))
+
+        # Drop features progressively
+        for r in range(1, limit_iter + 1):
+            to_drop = set(ranking[:r])
+            kept = [c for c in all_cols if c not in to_drop]
+
+            X_sub_tr = X_train[kept]
+            X_sub_va = X_val[kept]
+
+            if X_sub_tr.shape[1] == 0:
+                score = _baseline_score_from_train(y_train, y_val, "cls" if is_cls else "reg")
+            else:
+                m = clone(model)
+                m.fit(X_sub_tr, y_train)
+                pred = m.predict(X_sub_va)
+                score = float(accuracy_score(y_val, pred)) if is_cls else float(r2_score(y_val, pred))
+
+            curve.append((r, score))
+
+        # Ensure last point for "all removed" if limit covered everything
+        if limit is None or limit_iter == len(ranking):
+            if len(curve) == 0 or curve[-1][0] != len(all_cols):
+                score_last = _baseline_score_from_train(y_train, y_val, "cls" if is_cls else "reg")
+                curve.append((len(all_cols), score_last))
+
+        S = slope_score_S(curve, alpha=0.8)
+        results[name] = {"Curve": curve, "Slope": S}
+
+    # Plot curves
+    _replot_curves(results, metric_name, filename)
+
+    # Save cache
+    try:
+        with open(results_file, "wb") as f:
+            pickle.dump(results, f)
+        print(f"[cache] Saved results -> {results_file}")
+    except Exception:
+        pass
+
+    return results
+
+
+def _replot_curves(results: Dict[str, Dict[str, Any]],
+                   metric_name: str,
+                   filename: str | None):
+    plt.figure(figsize=(8, 5))
+    for name, obj in results.items():
+        xs, ys = zip(*obj["Curve"])
+        plt.plot(xs, ys, marker='o', linewidth=2, label=f"{name} (S={obj['Slope']:.3f})")
+    plt.xlabel("# features removed")
+    plt.ylabel(metric_name)
+    plt.title(f"{metric_name} vs #Features Removed")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    if filename:
+        plt.savefig(filename, dpi=150)
+        print(f"[plot] Saved: {filename}")
+    plt.show()
+
+
+# =============================================================================
+# MAIN BENCHMARK: build MST graph, run ShapG, CIS, SamplingSHAP, LIME, plot
+# =============================================================================
+
+def benchmark_feature_importance(reader: Callable[[], Tuple[pd.DataFrame, np.ndarray]],
+                                 model,
+                                 filename: str | None = None,
+                                 limit: int | None = 10,
+                                 *,
+                                 # explainer budgets (tune for your machine)
+                                 sampling_shap_bg: int = 200,
+                                 sampling_shap_nsamples: int = 2048,
+                                 lime_rows: int = 300,
+                                 random_state: int = 42):
+    """
+    Benchmark feature importance using ShapG+MST, CIS, SamplingSHAP, and LIME.
+
+    - If `model` is a classifier, curves/metrics are in Accuracy (like Section 5).
+    - If `model` is a regressor, curves/metrics are in R².
+    """
+    # ---- Load data ----
+    X, y = reader()
+    is_cls = isinstance(model, lgb.LGBMClassifier)
+
+    # ---- Build correlation matrix & MST graph (Spearman) ----
+    W = matrix_generator_mst(X, method=spearmanr)
+    A, _ = create_minimal_edge_graph_mst(W, version='mst', verbose=True)
+    G = nx.Graph(A)
+
+    # ---- KPI selector to be consistent with the benchmark metric ----
+    def f_only_S(S):
+        return classification_kpi(X, y, S) if is_cls else r2_kpi(X, y, S)
+
+    def f_with_G(Gin, S):
+        return f_only_S(S)
+
+    # ---- ShapG on MST (use same KPI as benchmark) ----
+    try:
+        shapg_vals = shapG(G, m=13, f=f_only_S, approximate_by_ratio=True)
+    except TypeError:
+        # Some builds expect f(G,S)
+        shapg_vals = shapG(G, m=13, f=f_with_G, approximate_by_ratio=True)
+
+    phi_mst = _to_phi_dict(shapg_vals, X.columns)
+    rank_mst = sorted(phi_mst, key=lambda f: abs(phi_mst[f]), reverse=True)
+
+    # ---- CIS baseline (if available) ----
+    rank_cis = None
+    if cis is not None:
+        try:
+            cis_vals = cis(G, f=f_with_G)  # many CIS impls expect f(G,S)
+        except TypeError:
+            cis_vals = cis(G, f=f_only_S)
+        phi_cis = _to_phi_dict(cis_vals, X.columns)
+        rank_cis = sorted(phi_cis, key=phi_cis.get, reverse=True)
+    else:
+        cis_vals = None
+        print("[warn] CIS module not found; skipping CIS curve.")
+
+    # ---- SamplingSHAP global ranking ----
+    rank_sampling = global_ranking_sampling_shap(
+        X, y, model, is_cls,
+        n_bg=sampling_shap_bg,
+        nsamples=sampling_shap_nsamples,
+        random_state=random_state
+    )
+
+    # ---- LIME global ranking ----
+    rank_lime = global_ranking_lime(
+        X, y, model, is_cls,
+        n_rows_lime=lime_rows,
+        random_state=random_state
+    )
+
+    # ---- Assemble rankings dict for plotting ----
+    feature_rankings = {'ShapG+MST': rank_mst}
+    if rank_cis is not None:
+        feature_rankings['CIS'] = rank_cis
+    if len(rank_sampling) > 0:
+        feature_rankings['SamplingSHAP'] = rank_sampling
+    if len(rank_lime) > 0:
+        feature_rankings['LIME'] = rank_lime
+
+    # ---- Plot/compute curves (Accuracy or R² auto by model type) ----
+    results = plot_KPI_comparison_by_dict(
+        reader, feature_rankings, model, filename, limit
+    )
+    print("Top-10 ShapG+MST to be dropped first:", rank_mst[:10])
+    print("Top-10 LIME to be dropped first:",      rank_lime[:10])
+    print("Top-10 SamplingSHAP to be dropped first:", rank_sampling[:10])
+
+    return shapg_vals, cis_vals, results
+
+
+# =============================================================================
+# OPTIONAL: dataset reader stub (keep yours if already defined elsewhere)
+# =============================================================================
+def h1n1_data_reader(filename: str = 'examples/data/process_data.csv',
+                     target_col: str = None) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    Load dataset. If target_col is None, assume the last column is the label.
+    Keep your own reader if you already have it in this file/project.
+    """
+    df = pd.read_csv(filename)
+    if target_col is None:
+        target_col = df.columns[-1]
+    X = df.drop(columns=[target_col])
+    y = df[target_col].values
+    return X, y
+
+def diabetes_data_reader(filename: str = 'examples/data/diabetes_binary_health_indicators_BRFSS2015.csv',
+                     target_col: str = None) -> Tuple[pd.DataFrame, np.ndarray]:
+    """
+    Load dataset. If target_col is None, assume the last column is the label.
+    Keep your own reader if you already have it in this file/project.
+    """
+    df = pd.read_csv(filename)
+    if target_col is None:
+        target_col = df.columns[-1]
+    X = df.drop(columns=[target_col])
+    y = df[target_col].values
+    return X, y
+
+
+# =============================================================================
+# Run directly: classification example (Accuracy curves like Section 5)
+# =============================================================================
 if __name__ == "__main__":
-    # Example usage
-    model = lgb.LGBMRegressor(learning_rate=0.3, verbosity=-1)
-    shapley_values, cis_values, results = benchmark_feature_importance(h1n1_data_reader, model, filename='h1n1_benchmark.png')
-    print("Shapley values:", shapley_values)
-    print("CIS values:", cis_values)
+    # Use your real reader if present; this stub uses last column as label.
+    reader = lambda: diabetes_data_reader('examples/data/Heart_disease_cleveland_new.csv')
+
+    # Classification benchmark (Accuracy)
+    model = lgb.LGBMClassifier(learning_rate=0.05, verbosity=-1)
+    shapg_vals, cis_vals, results = benchmark_feature_importance(
+        reader,
+        model,
+        filename="accuracy_benchmark_shapg_mst_vs_cis_sampling_lime.png",
+        limit=None,                 # set an int (e.g., 15) to drop only first K features for speed
+        sampling_shap_bg=200,       # tune for compute budget
+        sampling_shap_nsamples=2048,
+        lime_rows=300,
+        random_state=42
+    )
+    print("Weighted slope S (alpha=0.8):",
+          {k: v["Slope"] for k, v in results.items()})
+    
