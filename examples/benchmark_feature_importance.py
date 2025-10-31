@@ -741,8 +741,8 @@ def benchmark_feature_importance(reader: Callable[[], Tuple[pd.DataFrame, np.nda
     is_cls = isinstance(model, lgb.LGBMClassifier)
 
     # ---- Build correlation matrix & MST graph (Spearman) ----
-    W = matrix_generator_mst(X, method=spearmanr)
-    A, _ = create_minimal_edge_graph_mst(W, version='mst', verbose=True)
+    W = matrix_generator(X, method=spearmanr)
+    A, _ = create_minimal_edge_graph(W, version='mst', verbose=True)
     G = nx.Graph(A)
 
     # ---- KPI selector to be consistent with the benchmark metric ----
@@ -819,11 +819,9 @@ def h1n1_data_reader(filename: str = 'examples/data/process_data.csv',
     Load dataset. If target_col is None, assume the last column is the label.
     Keep your own reader if you already have it in this file/project.
     """
-    df = pd.read_csv(filename)
-    if target_col is None:
-        target_col = df.columns[-1]
-    X = df.drop(columns=[target_col])
-    y = df[target_col].values
+    data = pd.read_csv(filename)
+    X = data.drop(['h1n1_vaccine','respondent_id','seasonal_vaccine'],axis = 1)
+    y =  data['h1n1_vaccine']
     return X, y
 
 def diabetes_data_reader(filename: str = 'examples/data/diabetes_binary_health_indicators_BRFSS2015.csv',
@@ -839,13 +837,19 @@ def diabetes_data_reader(filename: str = 'examples/data/diabetes_binary_health_i
     y = df[target_col].values
     return X, y
 
+def heart_disease_data_reader(filename='xamples/data/Heart_disease_cleveland_new.csv'):
+    data = pd.read_csv(filename)
+    X = data.drop(['target'],axis = 1)
+    y =  data['target']
+    return X, y
+
 
 # =============================================================================
 # Run directly: classification example (Accuracy curves like Section 5)
 # =============================================================================
 if __name__ == "__main__":
     # Use your real reader if present; this stub uses last column as label.
-    reader = lambda: diabetes_data_reader('examples/data/Heart_disease_cleveland_new.csv')
+    reader = lambda: h1n1_data_reader('examples/data/process_data.csv')
 
     # Classification benchmark (Accuracy)
     model = lgb.LGBMClassifier(learning_rate=0.05, verbosity=-1)
